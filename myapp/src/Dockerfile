@@ -9,6 +9,7 @@ ARG CANARY=false
 
 COPY index.html /build/index.html
 
+
 # Replace placeholders
 RUN sed -i "s|APP_VERSION|${APP_VERSION}|g" index.html && \
     sed -i "s|BUILD_ID|${BUILD_ID}|g" index.html && \
