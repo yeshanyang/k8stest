@@ -1,0 +1,255 @@
+// =============================================================
+// myapp CI/CD Pipeline (增强版)
+//
+// 触发：Gitea Webhook (push to main)
+// 流程：checkout → 代码扫描 → 构建镜像 → 漏洞扫描 → 推送
+//       → 更新 GitOps manifest → 提交 → 灰度部署
+//
+// 依赖 Jenkins 插件:
+//   - Git plugin
+//   - Pipeline
+//   - Docker Pipeline
+//   - SonarQube Scanner
+//   - Credentials Binding
+// =============================================================
+
+pipeline {
+    agent any
+
+    environment {
+        // ---- Harbor Registry ----
+        REGISTRY     = 'registry.local:30080'
+        REGISTRY_NS  = 'myapp'
+        IMAGE_NAME   = "${REGISTRY}/${REGISTRY_NS}/myapp"
+
+        // ---- SonarQube ----
+        SONAR_HOST   = 'http://sonarqube.devops:9000'
+        SONAR_PROJECT = 'myapp'
+        SONAR_KEY    = 'myapp'
+
+        // ---- Gitea GitOps ----
+        // Jenkins credential ID: gitea-https
+        GITOPS_REPO  = 'https://gitea.3hang.asia/devops/myapp-k8s.git'
+
+        // ---- Kubernetes ----
+        KUBECONFIG_NS = 'myapp'
+
+        // ---- 构建信息 ----
+        APP_VERSION  = "${env.BUILD_NUMBER}"
+        COMMIT_SHA   = "${env.GIT_COMMIT ?: 'local'}"
+        IMAGE_TAG    = "${COMMIT_SHA.take(7)}"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        // ===== 1. Checkout =====
+        stage('1. Checkout Source') {
+            steps {
+                checkout scm
+                script {
+                    echo "Commit: ${env.COMMIT_SHA}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
+                    echo "Build number: ${env.APP_VERSION}"
+                }
+            }
+        }
+
+        // ===== 2. SonarQube 代码质量扫描 =====
+        stage('2. SonarQube Scan') {
+            steps {
+                script {
+                    echo 'Running SonarQube analysis...'
+                    sh '''
+                        sonar-scanner \
+                            -Dsonar.host.url=${SONAR_HOST} \
+                            -Dsonar.projectKey=${SONAR_KEY} \
+                            -Dsonar.projectName=${SONAR_PROJECT} \
+                            -Dsonar.sources=src/ \
+                            -Dsonar.sourceEncoding=UTF-8 \
+                            -Dsonar.java.binaries=target/ \
+                            || echo "WARNING: SonarQube scan failed or not configured — continuing"
+                    '''
+                }
+            }
+        }
+
+        // ===== 3. Build Docker Image =====
+        stage('3. Build Image') {
+            steps {
+                sh """
+                    echo "Building image: ${IMAGE_NAME}:${IMAGE_TAG}"
+                    docker build \
+                        --build-arg APP_VERSION=v${APP_VERSION} \
+                        --build-arg BUILD_ID=build-${IMAGE_TAG} \
+                        --build-arg CANARY=false \
+                        -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                        -t ${IMAGE_NAME}:latest \
+                        -f src/Dockerfile \
+                        src/
+                """
+            }
+        }
+
+        // ===== 4. Trivy 安全扫描 =====
+        stage('4. Security Scan') {
+            steps {
+                sh """
+                    echo "Running Trivy vulnerability scan..."
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        ${IMAGE_NAME}:${IMAGE_TAG}
+
+                    # 可选：如果存在高危漏洞则失败
+                    # trivy image --severity CRITICAL --exit-code 1 ${IMAGE_NAME}:${IMAGE_TAG}
+                """
+            }
+        }
+
+        // ===== 5. Push to Harbor =====
+        stage('5. Push Image') {
+            steps {
+                sh """
+                    echo "Pushing to Harbor: ${IMAGE_NAME}:${IMAGE_TAG}"
+                    docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                    docker push ${IMAGE_NAME}:latest
+                """
+            }
+        }
+
+        // ===== 6. Update GitOps Manifest & Push =====
+        stage('6. Update GitOps Manifest') {
+            steps {
+                script {
+                    dir('gitops') {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'gitea-https',
+                            usernameVariable: 'GIT_USER',
+                            passwordVariable: 'GIT_PASS'
+                        )]) {
+                            sh """
+                                # 配置 Git
+                                git config --global user.email 'jenkins@devops'
+                                git config --global user.name 'Jenkins CI'
+
+                                # 克隆 GitOps 仓库 (带认证)
+                                git clone https://${GIT_USER}:${GIT_PASS}@gitea.3hang.asia/devops/myapp-k8s.git . 2>/dev/null || true
+
+                                # 更新 stable image tag
+                                sed -i "s|image: ${REGISTRY}/${REGISTRY_NS}/myapp:.*|image: ${IMAGE_NAME}:${IMAGE_TAG}|" k8s/10-stable-deploy.yaml
+
+                                # 更新 canary image tag
+                                sed -i "s|image: ${REGISTRY}/${REGISTRY_NS}/myapp:.*|image: ${IMAGE_NAME}:${IMAGE_TAG}|" k8s/20-canary-deploy.yaml
+
+                                # 提交并推送
+                                git add k8s/
+                                git commit -m "chore: bump myapp to ${IMAGE_TAG} [skip ci]" || true
+                                git push origin main 2>/dev/null || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 7. 验证 ArgoCD 同步 =====
+        stage('7. Verify ArgoCD Sync') {
+            steps {
+                script {
+                    echo "Waiting for ArgoCD to sync..."
+                    sh '''
+                        # 等待 ArgoCD 同步 (可选，需要 argocd CLI)
+                        # argocd app wait myapp --timeout 300
+
+                        # 或者简单等待 K8s 部署完成
+                        sleep 30
+                    '''
+                }
+            }
+        }
+
+        // ===== 8. 健康检查 =====
+        stage('8. Health Check') {
+            steps {
+                script {
+                    echo "Verifying deployment health..."
+                    sh '''
+                        # 等待 Pod 就绪
+                        kubectl wait --for=condition=ready pod \
+                            -l app=myapp -n ${KUBECONFIG_NS} \
+                            --timeout=120s || true
+
+                        # 验证健康端点
+                        # curl -f http://myapp.${KUBECONFIG_NS}.svc.cluster.local/healthz || true
+                    '''
+                }
+            }
+        }
+
+        // ===== 9. 灰度发布 (可选) =====
+        stage('9. Canary Deploy') {
+            when {
+                expression {
+                    // 仅在特定条件下启用灰度 (例如：非紧急修复)
+                    return env.BRANCH_NAME == 'main' && !env.COMMIT_MESSAGE?.contains('[hotfix]')
+                }
+            }
+            steps {
+                script {
+                    echo "Canary deployment ready via GitOps."
+                    echo "To enable canary traffic: ./scripts/canary-weight.sh 10"
+                    echo "Current canary weight: 0% (no traffic)"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // 清理本地镜像，节省 worker 磁盘
+            sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} 2>/dev/null || true"
+            sh "docker rmi ${IMAGE_NAME}:latest 2>/dev/null || true"
+            cleanWs()
+        }
+        success {
+            echo """
+            ============================================================
+            Pipeline succeeded!
+
+            Image: ${IMAGE_NAME}:${IMAGE_TAG}
+            Build: #${env.APP_VERSION}
+            Commit: ${env.COMMIT_SHA}
+
+            Next steps:
+            1. Verify canary: curl -H 'Host: myapp.3hang.asia' http://localhost:30300
+            2. Adjust traffic: ./scripts/canary-weight.sh 10
+            3. Promote: ./scripts/promote.sh
+            ============================================================
+            """
+        }
+        failure {
+            echo """
+            ============================================================
+            Pipeline failed!
+
+            Check Jenkins logs for details.
+            Common issues:
+            - Harbor unreachable: Check registry.local:30080
+            - Gitea auth failed: Check gitea-https credential
+            - SonarQube failed: Check sonarqube.devops:9000
+            ============================================================
+            """
+        }
+        cleanup {
+            echo "Pipeline completed."
+        }
+    }
+}

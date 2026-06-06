@@ -1,0 +1,51 @@
+# ---- Main Ingress → stable ----
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp
+  namespace: myapp
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: myapp.3hang.asia
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp
+                port:
+                  number: 80
+---
+# ---- Canary Ingress (traffic split) ----
+# 利用 nginx-ingress 的 canary annotation 做权重路由
+# 注意: 必须设置 canary-by-header 等字段来禁用 header/cookie 匹配
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-canary
+  namespace: myapp
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "0"
+    # 禁用 header/cookie 方式的 canary，仅用权重
+    nginx.ingress.kubernetes.io/canary-by-header: never
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: myapp.3hang.asia
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp-canary
+                port:
+                  number: 80

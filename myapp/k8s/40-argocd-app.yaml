@@ -1,0 +1,37 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: myapp
+    app.kubernetes.io/part-of: devops
+spec:
+  project: default
+
+  # ---- GitOps 仓库 (Gitea) ----
+  source:
+    repoURL: https://gitea.3hang.asia/devops/myapp-k8s.git
+    targetRevision: main
+    path: k8s/
+
+  # ---- 目标集群 ----
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: myapp
+
+  # ---- 自动同步 ----
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+
+  # ---- 忽略 ArgoCD 自身 CRD 的 health check ----
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/selector/matchLabels

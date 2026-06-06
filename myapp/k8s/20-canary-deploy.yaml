@@ -1,0 +1,71 @@
+# ---- Canary Deployment (new version, light traffic) ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-canary
+  namespace: myapp
+  labels:
+    app: myapp-canary
+    track: canary
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: myapp-canary
+      track: canary
+  template:
+    metadata:
+      labels:
+        app: myapp-canary
+        track: canary
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "80"
+        prometheus.io/path: "/healthz"
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: worker2
+      containers:
+        - name: myapp
+          # Jenkins pipeline 替换为 canary tag
+          image: registry.local:30080/myapp/myapp:latest
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+# ---- Canary Service ----
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-canary
+  namespace: myapp
+  labels:
+    app: myapp-canary
+    track: canary
+spec:
+  selector:
+    app: myapp-canary
+    track: canary
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
